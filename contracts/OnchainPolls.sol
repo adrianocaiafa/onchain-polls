@@ -38,4 +38,33 @@ contract OnchainPolls {
     /// @notice 1 voto por carteira por enquete
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
+    // -------------------------
+    // Create
+    // -------------------------
+    function createPoll(string calldata question, string[] calldata options) external returns (uint256 pollId) {
+        if (bytes(question).length == 0) revert InvalidQuestion();
+        if (options.length < 2) revert InvalidOptions();
+
+        // (opcional) impedir opções vazias
+        for (uint256 i = 0; i < options.length; i++) {
+            if (bytes(options[i]).length == 0) revert InvalidOptions();
+        }
+
+        pollId = ++pollCount;
+
+        Poll storage p = polls[pollId];
+        p.creator = msg.sender;
+        p.isOpen = true;
+        p.question = question;
+        p.createdAt = block.timestamp;
+
+        // Copia item a item (evita erro do old code generator)
+        for (uint256 i = 0; i < options.length; i++) {
+            p.options.push(options[i]);
+            p.votes.push(0);
+        }
+
+        emit PollCreated(pollId, msg.sender, question, options.length);
+    }
+
 }
