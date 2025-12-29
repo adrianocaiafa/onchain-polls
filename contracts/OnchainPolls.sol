@@ -15,4 +15,27 @@ contract OnchainPolls {
     error InvalidQuestion();
     error InvalidOptions();
 
+    // -------------------------
+    // Events
+    // -------------------------
+    event PollCreated(uint256 indexed pollId, address indexed creator, string question, uint256 optionsCount);
+    event Voted(uint256 indexed pollId, address indexed voter, uint256 indexed optionIndex);
+    event PollClosed(uint256 indexed pollId, address indexed creator);
+
+    struct Poll {
+        address creator;
+        bool isOpen;
+        string question;
+        string[] options;
+        uint256[] votes; // votes[i] => total da opção i
+        uint256 createdAt;
+        uint256 closedAt;
+    }
+
+    uint256 public pollCount;
+    mapping(uint256 => Poll) private polls;
+
+    /// @notice 1 voto por carteira por enquete
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+
 }
