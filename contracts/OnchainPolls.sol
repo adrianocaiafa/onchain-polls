@@ -2,9 +2,8 @@
 pragma solidity ^0.8.20;
 
 /// @title OnchainPolls
-/// @notice On-chain polls: creators define questions and options, users vote once, creators close polls.
-///         Polls can be edited (question/options/fee) only BEFORE the first vote.
-///         Votes may require an ETH fee per vote (can be zero).
+/// @notice On-chain polls: creators define questions/options, users vote once, creators close polls.
+///         Optional feePerVote per poll; builder takes a small share (bps) of vote fees; createFee per poll.
 contract OnchainPolls {
     // -------------------------
     // Errors (gas efficient)
@@ -16,88 +15,86 @@ contract OnchainPolls {
     error AlreadyVoted();
     error InvalidQuestion();
     error InvalidOptions();
-    error PollAlreadyStarted(); // someone already voted
-    error WrongFee();
-    error WithdrawFailed();
+    error PollHasVotes();            // cannot edit after first vote
+    error InvalidFee();
+    error InvalidPayment();
     error NothingToWithdraw();
 
     // ------------------------
-    // Constants
+    // Constants (guardrails)
     // ------------------------
     uint256 public constant MAX_LEN_QUESTION = 280;
     uint256 public constant MAX_LEN_OPTION = 84;
     uint256 public constant MIN_OPTIONS = 2;
     uint256 public constant MAX_OPTIONS = 10;
 
+    /// @dev 0.001 ETH max per vote (Base uses ETH as native)
+    uint256 public constant MAX_FEE_PER_VOTE = 0.001 ether;
+
+    /// @dev 0.005 ETH max to create a poll
+    uint256 public constant MAX_CREATE_FEE = 0.005 ether;
+
+    /// @dev builder share max 10% (1000 bps)
+    uint256 public constant MAX_BPS = 1000;
+
     // -------------------------
     // Events
     // -------------------------
-    event PollCreated(
-        uint256 indexed pollId,
-        address indexed creator,
-        string question,
-        uint256 optionsCount,
-        uint256 feePerVoteWei
-    );
-    event Voted(uint256 indexed pollId, address indexed voter, uint256 indexed optionIndex, uint256 feePaidWei);
+    event PollCreated(uint256 indexed pollId, address indexed creator, string question, uint256 optionsCount, uint256 feePerVote);
+    event PollEdited(uint256 indexed pollId, address indexed creator);
+    event Voted(uint256 indexed pollId, address indexed voter, uint256 indexed optionIndex);
     event PollClosed(uint256 indexed pollId, address indexed creator);
-    event PollQuestionEdited(uint256 indexed pollId, address indexed creator, string newQuestion);
-    event PollOptionsEdited(uint256 indexed pollId, address indexed creator, uint256 newOptionsCount);
-    event PollFeeEdited(uint256 indexed pollId, address indexed creator, uint256 newFeePerVoteWei);
-    event FeesWithdrawn(uint256 indexed pollId, address indexed creator, uint256 amountWei);
+    event CreatorWithdraw(address indexed creator, uint256 amount);
+    event BuilderWithdraw(address indexed builder, uint256 amount);
+    event FeesUpdated(uint256 createFee, uint256 builderBps);
+
+    // -------------------------
+    // State
+    // -------------------------
+    address public immutable builder;     // you (deployer)
+    uint256 public createFee;             // fee charged on createPoll
+    uint256 public builderBps;            // builder cut from feePerVote (in basis points)
+
+    uint256 public pollCount;
+    uint256 public builderBalance;
 
     struct Poll {
         address creator;
         bool isOpen;
-
         string question;
         string[] options;
-
-        uint256[] votes;   // votes[i] => total votes for option i
+        uint256[] votes;
         uint256 totalVotes;
-
-        uint256 feePerVoteWei; // can be 0
-        uint256 feesAccruedWei; // accumulated from votes
-
+        uint256 feePerVote;   // per-poll vote fee (can be 0)
         uint256 createdAt;
         uint256 closedAt;
     }
 
-    uint256 public pollCount;
     mapping(uint256 => Poll) private polls;
-
-    /// @notice 1 vote per wallet per poll
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
+    /// @dev accumulated fees for poll creators
+    mapping(address => uint256) public creatorBalances;
+
+    constructor(uint256 _createFee, uint256 _builderBps) {
+        builder = msg.sender;
+        _setFees(_createFee, _builderBps);
+    }
+
     // -------------------------
-    // Internal validators
+    // Admin-like (builder only)
     // -------------------------
-    function _validateQuestion(string calldata question) internal pure {
-        uint256 lenQuestion = bytes(question).length;
-        if (lenQuestion == 0 || lenQuestion > MAX_LEN_QUESTION) revert InvalidQuestion();
+    function setFees(uint256 _createFee, uint256 _builderBps) external {
+        if (msg.sender != builder) revert NotCreator();
+        _setFees(_createFee, _builderBps);
     }
 
-    function _validateOptions(string[] calldata options) internal pure {
-        uint256 countOptions = options.length;
-        if (countOptions < MIN_OPTIONS || countOptions > MAX_OPTIONS) revert InvalidOptions();
-
-        for (uint256 i = 0; i < options.length; i++) {
-            uint256 lenOption = bytes(options[i]).length;
-            if (lenOption == 0 || lenOption > MAX_LEN_OPTION) revert InvalidOptions();
-        }
-    }
-
-    function _getPoll(uint256 pollId) internal view returns (Poll storage p) {
-        p = polls[pollId];
-        if (p.creator == address(0)) revert PollNotFound();
-    }
-
-    function _onlyCreator(Poll storage p) internal view {
-        if (msg.sender != p.creator) revert NotCreator();
-    }
-
-    function _onlyBeforeFirstVote(Poll storage p) internal view {
-        if (p.totalVotes != 0) revert PollAlreadyStarted();
+    function _setFees(uint256 _createFee, uint256 _builderBps) internal {
+        if (_createFee > MAX_CREATE_FEE) revert InvalidFee();
+        if (_builderBps > MAX_BPS) revert InvalidFee();
+        createFee = _createFee;
+        builderBps = _builderBps;
+        emit FeesUpdated(_createFee, _builderBps);
     }
 
     // -------------------------
@@ -106,10 +103,29 @@ contract OnchainPolls {
     function createPoll(
         string calldata question,
         string[] calldata options,
-        uint256 feePerVoteWei
-    ) external returns (uint256 pollId) {
-        _validateQuestion(question);
-        _validateOptions(options);
+        uint256 feePerVote
+    ) external payable returns (uint256 pollId) {
+        // payment: require exact createFee (and block accidental extra)
+        if (createFee == 0) {
+            if (msg.value != 0) revert InvalidPayment();
+        } else {
+            if (msg.value != createFee) revert InvalidPayment();
+            builderBalance += msg.value;
+        }
+
+        // fee per vote guardrails
+        if (feePerVote > MAX_FEE_PER_VOTE) revert InvalidFee();
+
+        uint256 lenQuestion = bytes(question).length;
+        if (lenQuestion == 0 || lenQuestion > MAX_LEN_QUESTION) revert InvalidQuestion();
+
+        uint256 countOptions = options.length;
+        if (countOptions < MIN_OPTIONS || countOptions > MAX_OPTIONS) revert InvalidOptions();
+
+        for (uint256 i = 0; i < countOptions; i++) {
+            uint256 lenOption = bytes(options[i]).length;
+            if (lenOption == 0 || lenOption > MAX_LEN_OPTION) revert InvalidOptions();
+        }
 
         pollId = ++pollCount;
 
@@ -117,74 +133,78 @@ contract OnchainPolls {
         p.creator = msg.sender;
         p.isOpen = true;
         p.question = question;
+        p.feePerVote = feePerVote;
         p.createdAt = block.timestamp;
-        p.feePerVoteWei = feePerVoteWei;
 
-        // Copy options and initialize votes
-        for (uint256 i = 0; i < options.length; i++) {
+        for (uint256 i = 0; i < countOptions; i++) {
             p.options.push(options[i]);
             p.votes.push(0);
         }
 
-        emit PollCreated(pollId, msg.sender, question, options.length, feePerVoteWei);
+        emit PollCreated(pollId, msg.sender, question, countOptions, feePerVote);
     }
 
     // -------------------------
     // Edit (only before first vote)
     // -------------------------
-    function editQuestion(uint256 pollId, string calldata newQuestion) external {
-        Poll storage p = _getPoll(pollId);
-        _onlyCreator(p);
+    function editPoll(
+        uint256 pollId,
+        string calldata newQuestion,
+        string[] calldata newOptions
+    ) external {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        if (msg.sender != p.creator) revert NotCreator();
         if (!p.isOpen) revert PollIsClosed();
-        _onlyBeforeFirstVote(p);
+        if (p.totalVotes != 0) revert PollHasVotes();
 
-        _validateQuestion(newQuestion);
-        p.question = newQuestion;
+        uint256 lenQuestion = bytes(newQuestion).length;
+        if (lenQuestion == 0 || lenQuestion > MAX_LEN_QUESTION) revert InvalidQuestion();
 
-        emit PollQuestionEdited(pollId, msg.sender, newQuestion);
-    }
+        uint256 countOptions = newOptions.length;
+        if (countOptions < MIN_OPTIONS || countOptions > MAX_OPTIONS) revert InvalidOptions();
 
-    function editOptions(uint256 pollId, string[] calldata newOptions) external {
-        Poll storage p = _getPoll(pollId);
-        _onlyCreator(p);
-        if (!p.isOpen) revert PollIsClosed();
-        _onlyBeforeFirstVote(p);
+        for (uint256 i = 0; i < countOptions; i++) {
+            uint256 lenOption = bytes(newOptions[i]).length;
+            if (lenOption == 0 || lenOption > MAX_LEN_OPTION) revert InvalidOptions();
+        }
 
-        _validateOptions(newOptions);
-
-        // Replace options and reset votes (still no votes happened, so safe)
+        // clear old arrays
         delete p.options;
         delete p.votes;
 
-        for (uint256 i = 0; i < newOptions.length; i++) {
+        p.question = newQuestion;
+
+        for (uint256 i = 0; i < countOptions; i++) {
             p.options.push(newOptions[i]);
             p.votes.push(0);
         }
 
-        emit PollOptionsEdited(pollId, msg.sender, newOptions.length);
-    }
-
-    function setVoteFee(uint256 pollId, uint256 newFeePerVoteWei) external {
-        Poll storage p = _getPoll(pollId);
-        _onlyCreator(p);
-        if (!p.isOpen) revert PollIsClosed();
-        _onlyBeforeFirstVote(p);
-
-        p.feePerVoteWei = newFeePerVoteWei;
-        emit PollFeeEdited(pollId, msg.sender, newFeePerVoteWei);
+        emit PollEdited(pollId, msg.sender);
     }
 
     // -------------------------
-    // Vote (payable)
+    // Vote
     // -------------------------
     function vote(uint256 pollId, uint256 optionIndex) external payable {
-        Poll storage p = _getPoll(pollId);
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
         if (!p.isOpen) revert PollIsClosed();
         if (optionIndex >= p.options.length) revert InvalidOption();
         if (hasVoted[pollId][msg.sender]) revert AlreadyVoted();
 
-        uint256 fee = p.feePerVoteWei;
-        if (msg.value != fee) revert WrongFee();
+        // payment safety
+        uint256 fee = p.feePerVote;
+        if (fee == 0) {
+            if (msg.value != 0) revert InvalidPayment();
+        } else {
+            if (msg.value != fee) revert InvalidPayment();
+
+            // split: builder cut + creator remainder
+            uint256 cut = (fee * builderBps) / 10_000;
+            builderBalance += cut;
+            creatorBalances[p.creator] += (fee - cut);
+        }
 
         hasVoted[pollId][msg.sender] = true;
 
@@ -193,21 +213,16 @@ contract OnchainPolls {
             p.totalVotes += 1;
         }
 
-        if (fee != 0) {
-            unchecked {
-                p.feesAccruedWei += fee;
-            }
-        }
-
-        emit Voted(pollId, msg.sender, optionIndex, fee);
+        emit Voted(pollId, msg.sender, optionIndex);
     }
 
     // -------------------------
     // Close (creator only)
     // -------------------------
     function closePoll(uint256 pollId) external {
-        Poll storage p = _getPoll(pollId);
-        _onlyCreator(p);
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        if (msg.sender != p.creator) revert NotCreator();
         if (!p.isOpen) revert PollIsClosed();
 
         p.isOpen = false;
@@ -217,29 +232,32 @@ contract OnchainPolls {
     }
 
     // -------------------------
-    // Withdraw fees (creator only)
+    // Withdrawals
     // -------------------------
-    function withdrawFees(uint256 pollId, address payable to) external {
-        Poll storage p = _getPoll(pollId);
-        _onlyCreator(p);
-
-        uint256 amount = p.feesAccruedWei;
+    function withdrawCreatorFees() external {
+        uint256 amount = creatorBalances[msg.sender];
         if (amount == 0) revert NothingToWithdraw();
+        creatorBalances[msg.sender] = 0;
 
-        // effects first
-        p.feesAccruedWei = 0;
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        require(ok, "TRANSFER_FAILED");
+        emit CreatorWithdraw(msg.sender, amount);
+    }
 
-        (bool ok, ) = to.call{value: amount}("");
-        if (!ok) revert WithdrawFailed();
+    function withdrawBuilderFees() external {
+        if (msg.sender != builder) revert NotCreator();
+        uint256 amount = builderBalance;
+        if (amount == 0) revert NothingToWithdraw();
+        builderBalance = 0;
 
-        emit FeesWithdrawn(pollId, msg.sender, amount);
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        require(ok, "TRANSFER_FAILED");
+        emit BuilderWithdraw(msg.sender, amount);
     }
 
     // -------------------------
     // Read helpers
     // -------------------------
-
-    /// @notice Poll info (ideal for UI cards / details)
     function getPollDetails(uint256 pollId)
         external
         view
@@ -249,13 +267,13 @@ contract OnchainPolls {
             string memory question,
             uint256 optionsCount,
             uint256 totalVotes,
-            uint256 feePerVoteWei,
-            uint256 feesAccruedWei,
+            uint256 feePerVote,
             uint256 createdAt,
             uint256 closedAt
         )
     {
-        Poll storage p = _getPoll(pollId);
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
 
         return (
             p.creator,
@@ -263,20 +281,19 @@ contract OnchainPolls {
             p.question,
             p.options.length,
             p.totalVotes,
-            p.feePerVoteWei,
-            p.feesAccruedWei,
+            p.feePerVote,
             p.createdAt,
             p.closedAt
         );
     }
 
-    /// @notice Full poll results (options + votes)
     function getPollResults(uint256 pollId)
         external
         view
         returns (string[] memory options, uint256[] memory votes)
     {
-        Poll storage p = _getPoll(pollId);
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
         return (p.options, p.votes);
     }
 }
