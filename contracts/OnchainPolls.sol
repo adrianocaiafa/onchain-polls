@@ -67,4 +67,22 @@ contract OnchainPolls {
         emit PollCreated(pollId, msg.sender, question, options.length);
     }
 
+    // -------------------------
+    // Vote
+    // -------------------------
+    function vote(uint256 pollId, uint256 optionIndex) external {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        if (!p.isOpen) revert PollIsClosed();
+        if (optionIndex >= p.options.length) revert InvalidOption();
+        if (hasVoted[pollId][msg.sender]) revert AlreadyVoted();
+
+        hasVoted[pollId][msg.sender] = true;
+        unchecked {
+            p.votes[optionIndex] += 1;
+        }
+
+        emit Voted(pollId, msg.sender, optionIndex);
+    }
+
 }
