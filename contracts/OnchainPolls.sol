@@ -85,4 +85,55 @@ contract OnchainPolls {
         emit Voted(pollId, msg.sender, optionIndex);
     }
 
+    // -------------------------
+    // Close (creator only)
+    // -------------------------
+    function closePoll(uint256 pollId) external {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        if (msg.sender != p.creator) revert NotCreator();
+        if (!p.isOpen) revert PollIsClosed();
+
+        p.isOpen = false;
+        p.closedAt = block.timestamp;
+
+        emit PollClosed(pollId, msg.sender);
+    }
+
+    // -------------------------
+    // Read helpers
+    // -------------------------
+    function getPollMeta(uint256 pollId)
+        external
+        view
+        returns (
+            address creator,
+            bool isOpen,
+            string memory question,
+            uint256 optionsCount,
+            uint256 createdAt,
+            uint256 closedAt
+        )
+    {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        return (p.creator, p.isOpen, p.question, p.options.length, p.createdAt, p.closedAt);
+    }
+
+    function getOption(uint256 pollId, uint256 optionIndex)
+        external
+        view
+        returns (string memory option, uint256 totalVotes)
+    {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        if (optionIndex >= p.options.length) revert InvalidOption();
+        return (p.options[optionIndex], p.votes[optionIndex]);
+    }
+
+    function getAllOptions(uint256 pollId) external view returns (string[] memory options, uint256[] memory votes) {
+        Poll storage p = polls[pollId];
+        if (p.creator == address(0)) revert PollNotFound();
+        return (p.options, p.votes);
+    }
 }
