@@ -18,6 +18,8 @@ contract OnchainPolls {
     // ------------------------
     // Constants
     // ------------------------
+    uint256 public constant MAX_LEN_QUESTION = 280;
+    uint256 public constant MAX_LEN_OPTION = 84;
     uint256 public constant MIN_OPTIONS = 2;
     uint256 public constant MAX_OPTIONS = 10;
 
@@ -52,13 +54,15 @@ contract OnchainPolls {
         external
         returns (uint256 pollId)
     {
-        if (bytes(question).length == 0) revert InvalidQuestion();
-        
-        uint256 len = options.length;
-        if (len < MIN_OPTIONS || len > MAX_OPTIONS) revert InvalidOptions();
+        uint256 lenQuestion = bytes(question).length;
+        if (lenQuestion == 0 || lenQuestion > MAX_LEN_QUESTION) revert InvalidQuestion();
+
+        uint256 countOptions = options.length;
+        if (countOptions < MIN_OPTIONS || countOptions > MAX_OPTIONS) revert InvalidOptions();
 
         for (uint256 i = 0; i < options.length; i++) {
-            if (bytes(options[i]).length == 0) revert InvalidOptions();
+            uint256 lenOption = bytes(options[i]).length;
+            if (lenOption == 0 || lenOption > MAX_LEN_OPTION) revert InvalidOptions();
         }
 
         pollId = ++pollCount;
