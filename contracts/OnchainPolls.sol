@@ -15,6 +15,12 @@ contract OnchainPolls {
     error InvalidQuestion();
     error InvalidOptions();
 
+    // ------------------------
+    // Constants
+    // ------------------------
+    uint256 public constant MIN_OPTIONS = 2;
+    uint256 public constant MAX_OPTIONS = 10;
+
     // -------------------------
     // Events
     // -------------------------
@@ -47,7 +53,9 @@ contract OnchainPolls {
         returns (uint256 pollId)
     {
         if (bytes(question).length == 0) revert InvalidQuestion();
-        if (options.length < 2) revert InvalidOptions();
+        
+        uint256 len = options.length;
+        if (len < MIN_OPTIONS || len > MAX_OPTIONS) revert InvalidOptions();
 
         for (uint256 i = 0; i < options.length; i++) {
             if (bytes(options[i]).length == 0) revert InvalidOptions();
